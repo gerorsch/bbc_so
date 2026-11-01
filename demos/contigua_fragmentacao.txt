@@ -1,0 +1,19 @@
+# Alocação CONTÍGUA: fragmentação externa e compactação
+format --alloc contiguous --block-size 4KB --blocks 16 -y
+mkdir /docs
+create /docs/a.txt --size 8KB
+create /docs/b.txt --size 12KB
+create /docs/c.txt --size 6KB
+create /docs/d.txt --size 10KB
+create /docs/e.txt --size 4KB
+fs_status
+# Apagando b.txt e d.txt surgem "buracos" de 3 blocos espalhados pelo disco
+rm /docs/b.txt /docs/d.txt
+fs_status --details
+# Há 9 blocos livres (36 KB), mas nenhum trecho com 5 blocos seguidos: a criação falha
+create /docs/grande.bin --size 20KB
+# A compactação junta os blocos livres em um único trecho no fim do disco
+defrag
+create /docs/grande.bin --size 20KB
+stat /docs/grande.bin
+fs_status

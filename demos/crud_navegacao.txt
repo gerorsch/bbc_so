@@ -1,0 +1,31 @@
+# CRUD e navegação com caminhos absolutos e relativos (alocação indexada, blocos de 1 KB)
+format --alloc indexed --block-size 1KB --blocks 32 -y
+mkdir -p /home/user/projetos
+cd /home/user
+pwd
+create doc.txt --content "Primeira versão do documento."
+create projetos/notas.md --size 1500B
+ls -l
+cat doc.txt
+cat /home/user/doc.txt
+# Atualizar: sobrescrever, acrescentar e redimensionar
+write doc.txt "Segunda versão, agora sobrescrita."
+append doc.txt " Linha acrescentada."
+cat doc.txt
+write projetos/notas.md --size 3KB
+stat projetos/notas.md
+# Mover/renomear usando caminhos relativos
+cd projetos
+mv ../doc.txt ./documento.txt
+mv notas.md /home/notas_movidas.md
+tree
+# Deletar
+rm documento.txt
+cd ..
+rmdir projetos
+rm -r /home
+tree
+# Erros tratados
+cat /nao/existe.txt
+rmdir /
+create /a/b.txt --size 1KB

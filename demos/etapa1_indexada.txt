@@ -1,0 +1,7 @@
+# Exemplos 1.1 e 1.2 do enunciado — alocação indexada (i-node), blocos de 4 KB
+format --alloc indexed --block-size 4KB --blocks 16 -y
+mkdir /sistema
+mkdir /sistema/logs
+create /sistema/logs/app.log --size 10KB
+tree
+fs_status --details

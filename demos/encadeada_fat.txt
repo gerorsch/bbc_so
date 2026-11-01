@@ -1,0 +1,16 @@
+# Alocação ENCADEADA (FAT): mesmo cenário da contígua, sem fragmentação externa
+format --alloc fat --block-size 4KB --blocks 16 -y
+mkdir /docs
+create /docs/a.txt --size 8KB
+create /docs/b.txt --size 12KB
+create /docs/c.txt --size 6KB
+create /docs/d.txt --size 10KB
+create /docs/e.txt --size 4KB
+rm /docs/b.txt /docs/d.txt
+# O arquivo de 20 KB cabe: a FAT encadeia blocos livres em qualquer posição
+create /docs/grande.bin --size 20KB
+stat /docs/grande.bin
+fs_status --details
+# defrag é opcional aqui: só reagrupa os blocos para melhorar a leitura sequencial
+defrag
+stat /docs/grande.bin
