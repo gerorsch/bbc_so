@@ -7,12 +7,14 @@ Todas implementam a mesma interface, usada pelo sistema de arquivos:
     release(inode)         libera todos os blocos do arquivo
     data_blocks(inode)     blocos de dados, na ordem lógica do arquivo
     meta_blocks(inode)     blocos de metadados que ocupam a área de dados (bloco de índice)
+
+Os primeiros `reserved` blocos do volume pertencem à área de metadados e nunca são alocados.
 """
 
+import copy
 import struct
 from abc import ABC, abstractmethod
 
-from .disk import Disk
 from .errors import FSError, NoSpaceError
 from .inode import Inode
 
@@ -21,9 +23,16 @@ class Allocator(ABC):
     key: str = ""
     label: str = ""
 
-    def __init__(self, disk: Disk):
-        self.disk = disk
-        self.bitmap = bytearray(disk.num_blocks)  # 0 = livre, 1 = ocupado
+    def __init__(self, dev, reserved: int = 0):
+        self.dev = dev  # volume (dispositivo de blocos lógico)
+        self.num_blocks = dev.num_blocks
+        self.reserved = reserved
+        self.bitmap = self._fresh_bitmap()  # 0 = livre, 1 = ocupado
+
+    def _fresh_bitmap(self) -> bytearray:
+        bitmap = bytearray(self.num_blocks)
+        bitmap[:self.reserved] = b"\1" * self.reserved
+        return bitmap
 
     # ---------- mapa de blocos livres ----------
     def is_free(self, b: int) -> bool:
@@ -35,14 +44,14 @@ class Allocator(ABC):
     def free_segments(self) -> list[tuple[int, int]]:
         """Trechos de blocos livres consecutivos como (início, comprimento)."""
         segments, start = [], None
-        for b in range(self.disk.num_blocks):
+        for b in range(self.num_blocks):
             if self.bitmap[b] == 0 and start is None:
                 start = b
             elif self.bitmap[b] == 1 and start is not None:
                 segments.append((start, b - start))
                 start = None
         if start is not None:
-            segments.append((start, self.disk.num_blocks - start))
+            segments.append((start, self.num_blocks - start))
         return segments
 
     def largest_free_segment(self) -> int:
@@ -54,11 +63,12 @@ class Allocator(ABC):
 
     def _give_back(self, b: int) -> None:
         self.bitmap[b] = 0
+        self.dev.discard(b)  # TRIM: avisa o dispositivo que o bloco não guarda mais dados
 
     def _first_free(self, count: int) -> list[int]:
         """Os `count` primeiros blocos livres (em qualquer posição do disco)."""
         found = []
-        for b in range(self.disk.num_blocks):
+        for b in range(self.num_blocks):
             if self.bitmap[b] == 0:
                 found.append(b)
                 if len(found) == count:
@@ -69,15 +79,24 @@ class Allocator(ABC):
             )
         return found
 
-    # ---------- estado persistente ----------
-    def get_state(self) -> dict:
-        return {"bitmap": self.bitmap.hex()}
+    # ---------- estado em memória (transações) ----------
+    def snapshot(self):
+        return copy.deepcopy(self.__dict__ | {"dev": None})
 
-    def set_state(self, state: dict) -> None:
-        self.bitmap = bytearray.fromhex(state["bitmap"])
+    def restore(self, snap) -> None:
+        dev = self.dev
+        self.__dict__.update(copy.deepcopy(snap))
+        self.dev = dev
 
     def reset(self) -> None:
-        self.bitmap = bytearray(self.disk.num_blocks)
+        self.bitmap = self._fresh_bitmap()
+
+    # ---------- i-node em disco: 2 campos inteiros de alocação ----------
+    @abstractmethod
+    def encode_alloc(self, inode: Inode) -> tuple[int, int]: ...
+
+    @abstractmethod
+    def decode_alloc(self, a0: int, a1: int) -> dict: ...
 
     # ---------- interface comum ----------
     def init_inode(self, inode: Inode) -> None:
@@ -114,6 +133,12 @@ class ContiguousAllocator(Allocator):
     key = "contiguous"
     label = "Contígua"
 
+    def encode_alloc(self, inode):
+        return inode.alloc.get("start", -1), inode.alloc.get("length", 0)
+
+    def decode_alloc(self, a0, a1):
+        return {"start": a0, "length": a1}
+
     def init_inode(self, inode: Inode) -> None:
         inode.alloc = {"start": -1, "length": 0}
 
@@ -142,7 +167,7 @@ class ContiguousAllocator(Allocator):
 
         # Crescer no lugar, se os blocos logo após o fim estiverem livres.
         end = start + n
-        if length and end <= self.disk.num_blocks and all(
+        if length and end <= self.num_blocks and all(
             self.is_free(b) for b in range(start + length, end)
         ):
             for b in range(start + length, end):
@@ -151,12 +176,13 @@ class ContiguousAllocator(Allocator):
             return
 
         # Realocar: libera o trecho atual e procura um trecho contíguo de n blocos.
-        for b in range(start, start + length):
-            self._give_back(b)
+        old = range(start, start + length)
+        for b in old:
+            self.bitmap[b] = 0  # sem TRIM: o conteúdo ainda será copiado se der certo
         new_start = self._first_fit(n)
         if new_start is None:
             free, largest = self.free_count(), self.largest_free_segment()
-            for b in range(start, start + length):
+            for b in old:
                 self._take(b)
             if free < n:
                 raise NoSpaceError(
@@ -169,11 +195,15 @@ class ContiguousAllocator(Allocator):
             )
         for b in range(new_start, new_start + n):
             self._take(b)
+        for b in old:
+            if self.bitmap[b] == 0:
+                self.dev.discard(b)
         inode.alloc = {"start": new_start, "length": n}
 
 
 FAT_FREE = -2
 FAT_EOF = -1
+FAT_RESERVED = -3
 
 
 class FATAllocator(Allocator):
@@ -186,20 +216,22 @@ class FATAllocator(Allocator):
     key = "fat"
     label = "Encadeada (FAT)"
 
-    def __init__(self, disk: Disk):
-        super().__init__(disk)
-        self.fat = [FAT_FREE] * disk.num_blocks
+    def __init__(self, dev, reserved: int = 0):
+        super().__init__(dev, reserved)
+        self.fat = self._fresh_fat()
 
-    def get_state(self) -> dict:
-        return {**super().get_state(), "fat": list(self.fat)}
-
-    def set_state(self, state: dict) -> None:
-        super().set_state(state)
-        self.fat = list(state["fat"])
+    def _fresh_fat(self) -> list[int]:
+        return [FAT_RESERVED] * self.reserved + [FAT_FREE] * (self.num_blocks - self.reserved)
 
     def reset(self) -> None:
         super().reset()
-        self.fat = [FAT_FREE] * self.disk.num_blocks
+        self.fat = self._fresh_fat()
+
+    def encode_alloc(self, inode):
+        return inode.alloc.get("first", FAT_EOF), -1
+
+    def decode_alloc(self, a0, a1):
+        return {"first": a0}
 
     def init_inode(self, inode: Inode) -> None:
         inode.alloc = {"first": FAT_EOF}
@@ -207,7 +239,7 @@ class FATAllocator(Allocator):
     def data_blocks(self, inode: Inode) -> list[int]:
         chain, b = [], inode.alloc.get("first", FAT_EOF)
         while b != FAT_EOF:
-            if b < 0 or len(chain) > self.disk.num_blocks:
+            if b < 0 or len(chain) > self.num_blocks:
                 raise FSError(f"cadeia FAT corrompida no i-node {inode.id}")
             chain.append(b)
             b = self.fat[b]
@@ -242,25 +274,53 @@ class IndexedAllocator(Allocator):
     Formato do bloco de índice no disco: uint32 com a quantidade de ponteiros,
     seguido dos ponteiros (uint32 little-endian). Não há fragmentação externa,
     mas cada arquivo paga um bloco extra de overhead.
+
+    Os blocos de índice ficam também em um cache em memória (como o cache de
+    i-nodes do kernel): consultas não geram E/S; toda alteração é gravada no disco.
     """
 
     key = "indexed"
     label = "Indexada (i-node)"
     _PTR = struct.Struct("<I")
 
+    def __init__(self, dev, reserved: int = 0):
+        super().__init__(dev, reserved)
+        self.cache: dict[int, list[int]] = {}  # bloco de índice -> ponteiros
+
+    def reset(self) -> None:
+        super().reset()
+        self.cache = {}
+
+    def encode_alloc(self, inode):
+        return inode.alloc.get("index", -1), -1
+
+    def decode_alloc(self, a0, a1):
+        return {"index": a0} if a0 >= 0 else {}
+
     @property
     def max_pointers(self) -> int:
-        return self.disk.block_size // self._PTR.size - 1
+        return self.dev.block_size // self._PTR.size - 1
 
-    def _write_index(self, index_block: int, pointers: list[int]) -> None:
+    def _write_index(self, inode: Inode, pointers: list[int]) -> None:
+        index_block = inode.alloc["index"]
         payload = self._PTR.pack(len(pointers)) + b"".join(self._PTR.pack(p) for p in pointers)
-        self.disk.write_block(index_block, payload)
+        self.dev.write_block(index_block, payload, tag=f"bloco de índice do i-node {inode.id}")
+        self.cache[index_block] = list(pointers)
+
+    def load_index(self, inode: Inode) -> None:
+        """Lê o bloco de índice do disco para o cache (usado na montagem)."""
+        index_block = inode.alloc["index"]
+        raw = self.dev.read_block(index_block, tag=f"bloco de índice do i-node {inode.id}")
+        (count,) = self._PTR.unpack_from(raw, 0)
+        if count > self.max_pointers:
+            raise FSError(f"bloco de índice corrompido no i-node {inode.id}")
+        self.cache[index_block] = [self._PTR.unpack_from(raw, 4 * (i + 1))[0] for i in range(count)]
 
     def init_inode(self, inode: Inode) -> None:
         (index_block,) = self._first_free(1)
         self._take(index_block)
-        self._write_index(index_block, [])
         inode.alloc = {"index": index_block}
+        self._write_index(inode, [])
 
     def meta_blocks(self, inode: Inode) -> list[int]:
         return [inode.alloc["index"]] if "index" in inode.alloc else []
@@ -268,11 +328,14 @@ class IndexedAllocator(Allocator):
     def data_blocks(self, inode: Inode) -> list[int]:
         if "index" not in inode.alloc:
             return []
-        raw = self.disk.read_block(inode.alloc["index"])
-        (count,) = self._PTR.unpack_from(raw, 0)
-        if count > self.max_pointers:
-            raise FSError(f"bloco de índice corrompido no i-node {inode.id}")
-        return [self._PTR.unpack_from(raw, 4 * (i + 1))[0] for i in range(count)]
+        if inode.alloc["index"] not in self.cache:
+            self.load_index(inode)
+        return list(self.cache[inode.alloc["index"]])
+
+    def release(self, inode: Inode) -> None:
+        index_block = inode.alloc.get("index")
+        super().release(inode)
+        self.cache.pop(index_block, None)
 
     def max_file_blocks(self) -> int:
         return max(0, min(self.free_count() - 1, self.max_pointers))
@@ -281,7 +344,7 @@ class IndexedAllocator(Allocator):
         if n > self.max_pointers:
             raise NoSpaceError(
                 f"arquivo grande demais para um único bloco de índice: o máximo é "
-                f"{self.max_pointers} blocos ({self.max_pointers * self.disk.block_size} bytes)"
+                f"{self.max_pointers} blocos ({self.max_pointers * self.dev.block_size} bytes)"
             )
         pointers = self.data_blocks(inode)
         if n < len(pointers):
@@ -295,7 +358,7 @@ class IndexedAllocator(Allocator):
             pointers += new_blocks
         else:
             return
-        self._write_index(inode.alloc["index"], pointers)
+        self._write_index(inode, pointers)
 
 
 STRATEGIES: dict[str, type[Allocator]] = {
@@ -309,8 +372,12 @@ ALIASES = {
 }
 
 
-def make_allocator(name: str, disk: Disk) -> Allocator:
+def strategy_key(name: str) -> str:
     key = ALIASES.get(name.lower())
     if key is None:
         raise FSError(f"estratégia desconhecida: '{name}' (use contiguous, fat ou indexed)")
-    return STRATEGIES[key](disk)
+    return key
+
+
+def make_allocator(name: str, dev, reserved: int = 0) -> Allocator:
+    return STRATEGIES[strategy_key(name)](dev, reserved)

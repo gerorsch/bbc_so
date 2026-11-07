@@ -1,37 +1,43 @@
-"""Sistema de arquivos hierárquico sobre o disco simulado.
+"""Sistema de arquivos hierárquico sobre um volume de blocos.
 
-Organização:
-  * Área de metadados (cabeçalho da imagem): superbloco, tabela de i-nodes e o
-    estado do alocador (bitmap de blocos livres e, na FAT, a tabela de encadeamento).
-  * Área de dados (os blocos do disco): conteúdo dos arquivos, conteúdo dos
-    diretórios (entradas nome -> i-node) e, na estratégia indexada, os blocos de índice.
+Tudo fica nos blocos do volume (ver `layout.py`): superbloco, bitmap, FAT,
+tabela de i-nodes, conteúdo dos diretórios (entradas nome -> i-node), conteúdo
+dos arquivos e blocos de índice. Em memória ficam apenas caches, como no kernel
+real: i-nodes, árvore de diretórios (dentries), bitmap/FAT e blocos de índice.
 
-A árvore de diretórios não é salva à parte: ao carregar a imagem, ela é
-reconstruída lendo os blocos de diretório a partir do i-node raiz.
+Cada operação é uma transação: os blocos de dados são gravados durante a operação
+e os blocos de metadados alterados são gravados ao final (commit). Se algo falhar,
+volume e caches voltam ao estado anterior. Toda leitura/gravação de bloco passa
+pelo volume e vira requisição de E/S nos discos físicos.
 """
 
 import copy
-import json
-import os
 import struct
 from contextlib import contextmanager
 
-from .allocation import Allocator, make_allocator
-from .disk import Disk
+from .allocation import Allocator, FATAllocator, IndexedAllocator, make_allocator, strategy_key
 from .errors import (
     AlreadyExistsError,
     CorruptImageError,
     DirNotEmptyError,
     FSError,
     IsADirError,
+    NoSpaceError,
     NotADirError,
     NotFoundError,
 )
 from .inode import DIR, FILE, Inode
+from .layout import (
+    Layout,
+    decode_bitmap,
+    decode_fat,
+    decode_inode,
+    encode_bitmap,
+    encode_fat,
+    encode_inode,
+)
 
 ROOT_ID = 0
-IMAGE_MAGIC = b"SIMOSFS1"
-IMAGE_VERSION = 1
 
 # Entrada de diretório: nome (28 bytes, UTF-8, completado com \0) + número do i-node (uint32).
 DIRENT = struct.Struct("<28sI")
@@ -39,58 +45,67 @@ MAX_NAME_BYTES = 28
 
 
 class FileSystem:
-    def __init__(self, disk: Disk, allocator: Allocator):
-        self.disk = disk
-        self.allocator = allocator
+    def __init__(self, dev, layout: Layout):
+        self.dev = dev
+        self.layout = layout
+        self.allocator: Allocator = make_allocator(layout.strategy, dev, reserved=layout.data_start)
         self.inodes: dict[int, Inode] = {}
-        self.next_id = ROOT_ID
+        self._meta_cache: dict[int, bytes] = {}  # último conteúdo gravado de cada bloco de metadados
+        self._tx_depth = 0
 
-    # ================================================================ criação / imagem
+    @property
+    def block_size(self) -> int:
+        return self.dev.block_size
+
+    @property
+    def num_blocks(self) -> int:
+        return self.dev.num_blocks
+
+    # ================================================================ mkfs / mount
     @classmethod
-    def format(cls, block_size: int, num_blocks: int, strategy: str) -> "FileSystem":
-        disk = Disk(block_size, num_blocks)
-        fs = cls(disk, make_allocator(strategy, disk))
-        root = fs._new_inode(DIR)
-        assert root.id == ROOT_ID
+    def mkfs(cls, dev, strategy: str, inode_count: int | None = None) -> "FileSystem":
+        """Cria um sistema de arquivos vazio no volume (como o mkfs)."""
+        layout = Layout.compute(dev.block_size, dev.num_blocks, strategy_key(strategy), inode_count)
+        fs = cls(dev, layout)
+        with fs.transaction():
+            root = fs._new_inode(DIR)
+            assert root.id == ROOT_ID
         return fs
 
-    def save(self, path: str) -> None:
-        meta = {
-            "version": IMAGE_VERSION,
-            "block_size": self.disk.block_size,
-            "num_blocks": self.disk.num_blocks,
-            "strategy": self.allocator.key,
-            "next_id": self.next_id,
-            "inodes": [inode.to_dict() for inode in self.inodes.values()],
-            "allocator": self.allocator.get_state(),
-        }
-        header = json.dumps(meta, ensure_ascii=False).encode()
-        tmp = f"{path}.tmp"
-        with open(tmp, "wb") as f:
-            f.write(IMAGE_MAGIC)
-            f.write(struct.pack("<I", len(header)))
-            f.write(header)
-            f.write(self.disk.data)
-        os.replace(tmp, path)
-
     @classmethod
-    def load(cls, path: str) -> "FileSystem":
-        with open(path, "rb") as f:
-            raw = f.read()
-        if raw[:8] != IMAGE_MAGIC:
-            raise CorruptImageError(f"'{path}' não é uma imagem de disco do SimOS")
-        (header_len,) = struct.unpack_from("<I", raw, 8)
-        try:
-            meta = json.loads(raw[12:12 + header_len])
-        except ValueError as e:
-            raise CorruptImageError(f"cabeçalho da imagem corrompido: {e}") from None
-        if meta.get("version") != IMAGE_VERSION:
-            raise CorruptImageError("versão de imagem não suportada")
-        disk = Disk(meta["block_size"], meta["num_blocks"], raw[12 + header_len:])
-        fs = cls(disk, make_allocator(meta["strategy"], disk))
-        fs.allocator.set_state(meta["allocator"])
-        fs.inodes = {d["id"]: Inode.from_dict(d) for d in meta["inodes"]}
-        fs.next_id = meta["next_id"]
+    def mount(cls, dev) -> "FileSystem":
+        """Lê os metadados do volume e reconstrói os caches em memória."""
+        raw = dev.read_block(0, tag="superbloco")
+        layout = Layout.decode_superblock(raw)
+        if layout.block_size != dev.block_size or layout.num_blocks != dev.num_blocks:
+            raise CorruptImageError("superbloco incompatível com a geometria do volume")
+        fs = cls(dev, layout)
+        fs._meta_cache[0] = raw
+
+        def read_region(start: int, count: int, tag: str) -> bytes:
+            chunks = []
+            for b in range(start, start + count):
+                data = dev.read_block(b, tag=tag)
+                fs._meta_cache[b] = data
+                chunks.append(data)
+            return b"".join(chunks)
+
+        a = fs.allocator
+        a.bitmap = decode_bitmap(read_region(layout.bitmap_start, layout.bitmap_blocks, "bitmap"),
+                                 layout.num_blocks)
+        if isinstance(a, FATAllocator):
+            a.fat = decode_fat(read_region(layout.fat_start, layout.fat_blocks, "tabela FAT"),
+                               layout.num_blocks)
+        table = read_region(layout.itable_start, layout.itable_blocks, "tabela de i-nodes")
+        for i in range(layout.inode_count):
+            decoded = decode_inode(table, i * 64, i)
+            if decoded is not None:
+                inode, a0, a1 = decoded
+                inode.alloc = a.decode_alloc(a0, a1)
+                fs.inodes[i] = inode
+        if isinstance(a, IndexedAllocator):
+            for inode in fs.inodes.values():
+                a.load_index(inode)
         fs._rebuild_tree()
         return fs
 
@@ -103,33 +118,76 @@ class FileSystem:
         pending = [root]
         while pending:
             d = pending.pop()
-            d.children = self._decode_dir(self._read_content(d))
+            d.children = self._decode_dir(self._read_content(d, "diretório (montagem)"))
             for name, child_id in d.children.items():
                 child = self.inodes.get(child_id)
                 if child is None:
-                    raise CorruptImageError(f"diretório '{self.path_of(d)}' aponta para i-node {child_id} inexistente")
+                    raise CorruptImageError(f"diretório aponta para i-node {child_id} inexistente")
                 child.name, child.parent = name, d.id
                 if child.is_dir:
                     pending.append(child)
 
+    # ================================================================ metadados em disco
+    def _encode_metadata(self) -> dict[int, bytes]:
+        """Imagem atual de cada bloco da área de metadados."""
+        L, bs = self.layout, self.block_size
+        blocks = {0: L.encode_superblock().ljust(bs, b"\0")}
+
+        def split(start: int, raw: bytes):
+            for i in range(len(raw) // bs):
+                blocks[start + i] = raw[i * bs:(i + 1) * bs]
+
+        split(L.bitmap_start, encode_bitmap(self.allocator.bitmap, L.bitmap_blocks, bs))
+        if isinstance(self.allocator, FATAllocator):
+            split(L.fat_start, encode_fat(self.allocator.fat, L.fat_blocks, bs))
+        table = bytearray(L.itable_blocks * bs)
+        for inode in self.inodes.values():
+            off = inode.id * 64
+            table[off:off + 64] = encode_inode(inode, *self.allocator.encode_alloc(inode))
+        split(L.itable_start, bytes(table))
+        return blocks
+
+    def _metadata_tag(self, b: int) -> str:
+        L = self.layout
+        region = L.region_of(b)
+        if region == "inodes":
+            ipb = L.inodes_per_block
+            first = (b - L.itable_start) * ipb
+            return f"tabela de i-nodes ({first}-{first + ipb - 1})"
+        return {"superbloco": "superbloco", "bitmap": "bitmap de blocos livres", "fat": "tabela FAT"}[region]
+
+    def _flush_metadata(self) -> None:
+        """Grava apenas os blocos de metadados que mudaram desde a última gravação."""
+        for b, data in self._encode_metadata().items():
+            if self._meta_cache.get(b) != data:
+                self.dev.write_block(b, data, tag=self._metadata_tag(b))
+                self._meta_cache[b] = data
+
     # ================================================================ transações
     @contextmanager
     def transaction(self):
-        """Torna a operação atômica: em caso de erro, disco e metadados voltam ao estado anterior."""
+        """Torna a operação atômica: em caso de erro, volume e caches voltam ao estado anterior."""
+        if self._tx_depth:
+            yield
+            return
         snapshot = (
-            bytes(self.disk.data),
-            copy.deepcopy(self.allocator.get_state()),
+            self.dev.snapshot(),
+            self.allocator.snapshot(),
             copy.deepcopy(self.inodes),
-            self.next_id,
+            dict(self._meta_cache),
         )
+        self._tx_depth = 1
         try:
             yield
+            self._flush_metadata()
         except BaseException:
-            data, alloc_state, inodes, next_id = snapshot
-            self.disk.data[:] = data
-            self.allocator.set_state(alloc_state)
-            self.inodes, self.next_id = inodes, next_id
+            dev_snap, alloc_snap, inodes, meta = snapshot
+            self.dev.restore(dev_snap)
+            self.allocator.restore(alloc_snap)
+            self.inodes, self._meta_cache = inodes, meta
             raise
+        finally:
+            self._tx_depth = 0
 
     # ================================================================ caminhos
     @property
@@ -188,17 +246,28 @@ class FileSystem:
             node = self.inodes[node.parent] if node.parent is not None else None
         return False
 
-    # ================================================================ conteúdo (camada física)
-    def _read_content(self, inode: Inode) -> bytes:
-        data = b"".join(self.disk.read_block(b) for b in self.allocator.data_blocks(inode))
+    # ================================================================ conteúdo (via volume)
+    def _label(self, inode: Inode, label: str | None = None) -> str:
+        what = label or self.path_of(inode)
+        return f"diretório '{what}'" if inode.is_dir else f"dados '{what}'"
+
+    def _read_content(self, inode: Inode, label: str | None = None) -> bytes:
+        blocks = self.allocator.data_blocks(inode)
+        tag = self._label(inode, label)
+        data = b"".join(
+            self.dev.read_block(b, tag=f"{tag} (parte {i}/{len(blocks)})")
+            for i, b in enumerate(blocks, start=1)
+        )
         return data[:inode.size]
 
-    def _write_content(self, inode: Inode, data: bytes) -> None:
+    def _write_content(self, inode: Inode, data: bytes, label: str | None = None) -> None:
         """Ajusta o número de blocos via estratégia de alocação e grava o conteúdo neles."""
-        bs = self.disk.block_size
+        bs = self.block_size
         self.allocator.resize(inode, -(-len(data) // bs))
-        for i, b in enumerate(self.allocator.data_blocks(inode)):
-            self.disk.write_block(b, data[i * bs:(i + 1) * bs])
+        blocks = self.allocator.data_blocks(inode)
+        tag = self._label(inode, label)
+        for i, b in enumerate(blocks):
+            self.dev.write_block(b, data[i * bs:(i + 1) * bs], tag=f"{tag} (parte {i + 1}/{len(blocks)})")
         inode.size = len(data)
         inode.touch()
 
@@ -218,10 +287,12 @@ class FileSystem:
         self._write_content(d, self._encode_dir(d.children))
 
     def _new_inode(self, kind: str) -> Inode:
-        inode = Inode(id=self.next_id, type=kind)
+        free_id = next((i for i in range(self.layout.inode_count) if i not in self.inodes), None)
+        if free_id is None:
+            raise NoSpaceError(f"tabela de i-nodes cheia ({self.layout.inode_count} i-nodes)")
+        inode = Inode(id=free_id, type=kind)
         self.allocator.init_inode(inode)
         self.inodes[inode.id] = inode
-        self.next_id += 1
         return inode
 
     def _link(self, parent: Inode, name: str, inode: Inode) -> None:
@@ -271,9 +342,17 @@ class FileSystem:
             if name in parent.children:
                 raise AlreadyExistsError(f"'{path}' já existe")
             f = self._new_inode(FILE)
-            self._write_content(f, data)
+            full_path = self.path_of(parent).rstrip("/") + "/" + name
+            self._write_content(f, data, label=full_path)
             self._link(parent, name, f)
             return f
+
+    def exists(self, path: str, cwd: int = ROOT_ID) -> bool:
+        try:
+            self.resolve(path, cwd)
+            return True
+        except FSError:
+            return False
 
     def _file(self, path: str, cwd: int) -> Inode:
         node = self.resolve(path, cwd)
@@ -375,15 +454,16 @@ class FileSystem:
         return self.allocator.meta_blocks(inode), self.allocator.data_blocks(inode)
 
     def compact(self) -> dict:
-        """Compacta/desfragmenta: realoca tudo em sequência a partir do bloco 0.
+        """Compacta/desfragmenta: realoca tudo em sequência a partir do início da área de dados.
 
         Mantém a ordem física atual dos objetos (cada um só "desliza" para trás),
         de modo que o espaço livre fica reunido em um único trecho no fim do disco.
+        Lê o conteúdo de todos os objetos e regrava só os blocos que mudaram de lugar.
         """
         with self.transaction():
             def first_block(inode):
                 meta, data = self.blocks_of(inode)
-                return min(meta + data, default=self.disk.num_blocks)
+                return min(meta + data, default=self.num_blocks)
 
             before = {i.id: self.blocks_of(i) for i in self.inodes.values()}
             segments_before = len(self.allocator.free_segments())
@@ -392,18 +472,23 @@ class FileSystem:
             contents = {i.id: self._read_content(i) for i in order}
 
             self.allocator.reset()
-            self.disk.wipe()
-            for inode in order:
-                mtime = inode.modified
-                self.allocator.init_inode(inode)
-                self._write_content(inode, contents[inode.id])
-                inode.modified = mtime
-
+            bs = self.block_size
             moved = 0
             for inode in order:
+                self.allocator.init_inode(inode)
+                self.allocator.resize(inode, -(-inode.size // bs))
                 old_meta, old_data = before[inode.id]
                 new_meta, new_data = self.blocks_of(inode)
                 moved += sum(a != b for a, b in zip(old_meta + old_data, new_meta + new_data))
+                data, tag = contents[inode.id], self._label(inode)
+                for i, b in enumerate(new_data):
+                    if i < len(old_data) and old_data[i] == b:
+                        continue  # o bloco já está no lugar certo
+                    self.dev.write_block(b, data[i * bs:(i + 1) * bs],
+                                         tag=f"{tag} (parte {i + 1}/{len(new_data)}) — realocado")
+            for b in range(self.layout.data_start, self.num_blocks):
+                if self.allocator.is_free(b):
+                    self.dev.discard(b)
             return {
                 "moved": moved,
                 "segments_before": segments_before,

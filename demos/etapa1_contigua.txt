@@ -1,5 +1,6 @@
 # Alocação CONTÍGUA: fragmentação externa e compactação
-format --alloc contiguous --block-size 4KB --blocks 16 -y
+format --alloc contiguous --block-size 4KB --blocks 16 --raid none --disk-type hdd -y
+io_trace off
 mkdir /docs
 create /docs/a.txt --size 8KB
 create /docs/b.txt --size 12KB
@@ -10,7 +11,7 @@ fs_status
 # Apagando b.txt e d.txt surgem "buracos" de 3 blocos espalhados pelo disco
 rm /docs/b.txt /docs/d.txt
 fs_status --details
-# Há 9 blocos livres (36 KB), mas nenhum trecho com 5 blocos seguidos: a criação falha
+# Há 6 blocos livres (24 KB), mas nenhum trecho com 5 blocos seguidos: a criação falha
 create /docs/grande.bin --size 20KB
 # A compactação junta os blocos livres em um único trecho no fim do disco
 defrag

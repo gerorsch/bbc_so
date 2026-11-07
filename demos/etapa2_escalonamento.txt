@@ -1,0 +1,20 @@
+# Etapa 2 — Escalonamento do braço do disco
+# Exemplo 2.1 do enunciado: fila de trilhas pendentes com a cabeça na trilha 53
+io_simulate --alg sstf --head 53 98 183 37 122 14
+# Os mesmos pedidos com todos os algoritmos implementados
+io_simulate --all --head 53 98 183 37 122 14 124 65 67
+
+# Agora a fila vem do próprio sistema de arquivos: HDD de 64 trilhas, escalonador SSTF
+format --alloc indexed --block-size 1KB --blocks 64 --disk-type hdd --raid none --sched sstf -y
+mkdir -p /sistema/logs
+create /sistema/logs/app.log --size 3KB
+# Cada gravação gera requisições de E/S nos blocos de dados, no bloco de índice e nos metadados
+write_file /sistema/logs/app.log "Novo Registro"
+io_trace detalhado
+create /sistema/relatorio.txt --size 5KB
+io_trace resumo
+# Mesma operação com o algoritmo C-SCAN
+io_sched cscan
+create /sistema/backup.txt --size 5KB
+read_file /sistema/logs/app.log
+disk_status

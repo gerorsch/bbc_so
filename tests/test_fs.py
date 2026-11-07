@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 
-from simos.fs.diagnostics import INDEX, analyze
+from simos.fs.diagnostics import INDEX, META, analyze
 from simos.fs.errors import (
     AlreadyExistsError,
     DirNotEmptyError,
@@ -15,9 +15,19 @@ from simos.fs.errors import (
 )
 from simos.fs.filesystem import FileSystem
 from simos.fs.units import compress_runs, fmt_size, parse_size
+from simos.kernel import HardwareConfig, Kernel
 
 KB = 1024
 STRATEGIES = ("contiguous", "fat", "indexed")
+
+
+def make_kernel(block_size: int, blocks: int, strategy: str, **hw) -> Kernel:
+    return Kernel.create(HardwareConfig(block_size=block_size, blocks=blocks, **hw), strategy)
+
+
+def make_fs(block_size: int, blocks: int, strategy: str, **hw) -> FileSystem:
+    """Sistema de arquivos sobre um HDD único (ou o hardware pedido em **hw)."""
+    return make_kernel(block_size, blocks, strategy, **hw).fs
 
 
 def snapshot(fs: FileSystem):
@@ -52,7 +62,8 @@ class CrudMixin:
     STRATEGY = ""
 
     def setUp(self):
-        self.fs = FileSystem.format(1 * KB, 64, self.STRATEGY)
+        self.kernel = make_kernel(1 * KB, 64, self.STRATEGY)
+        self.fs = self.kernel.fs
 
     def test_paths_absolute_and_relative(self):
         fs = self.fs
@@ -80,7 +91,8 @@ class CrudMixin:
         fs.remove("/g.txt")
         fs.rmdir("/d")
         self.assertEqual(fs.listdir("/"), [])
-        self.assertEqual(fs.allocator.free_count(), 64 - len(fs.allocator.meta_blocks(fs.root)))
+        reserved = fs.layout.data_start + len(fs.allocator.meta_blocks(fs.root))
+        self.assertEqual(fs.allocator.free_count(), 64 - reserved)
 
     def test_errors(self):
         fs = self.fs
@@ -109,7 +121,8 @@ class CrudMixin:
         fs.move("/a", "/dest")
         self.assertEqual(fs.read("/dest/a/b/f"), b"conteudo")
         self.assertEqual(fs.remove("/dest", recursive=True), 4)
-        used_by_root = len(fs.allocator.meta_blocks(fs.root)) + len(fs.allocator.data_blocks(fs.root))
+        used_by_root = (fs.layout.data_start + len(fs.allocator.meta_blocks(fs.root))
+                        + len(fs.allocator.data_blocks(fs.root)))
         self.assertEqual(analyze(fs).used_blocks, used_by_root)
 
     def test_internal_fragmentation(self):
@@ -140,11 +153,12 @@ class CrudMixin:
         fs.remove("/sistema/logs/app.log")
         fs.create("/sistema/logs/novo.log", b"n" * 5000)
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "disk.img")
-            fs.save(path)
-            loaded = FileSystem.load(path)
+            path = os.path.join(tmp, "simos.img")
+            self.kernel.save(path)
+            loaded = Kernel.load(path).fs
         self.assertEqual(snapshot(loaded), snapshot(fs))
-        self.assertEqual(loaded.allocator.get_state(), fs.allocator.get_state())
+        self.assertEqual(loaded.allocator.bitmap, fs.allocator.bitmap)
+        self.assertEqual(getattr(loaded.allocator, "fat", None), getattr(fs.allocator, "fat", None))
         loaded.create("/sistema/outro", b"ok")  # continua utilizável
         self.assertEqual(loaded.read("/sistema/outro"), b"ok")
 
@@ -174,8 +188,8 @@ class TestIndexedCrud(CrudMixin, unittest.TestCase):
 
 
 def holes_scenario(strategy: str, blocks: int = 16) -> FileSystem:
-    """Disco com blocos de 4 KB e dois buracos (b.txt e d.txt removidos)."""
-    fs = FileSystem.format(4 * KB, blocks, strategy)
+    """Disco com blocos de 4 KB e dois buracos de 3 blocos (b.txt e d.txt removidos)."""
+    fs = make_fs(4 * KB, blocks, strategy)
     fs.mkdir("/docs")
     for name, size in (("a", 8), ("b", 12), ("c", 6), ("d", 10), ("e", 4)):
         fs.create(f"/docs/{name}.txt", b"x" * size * KB)
@@ -187,11 +201,12 @@ def holes_scenario(strategy: str, blocks: int = 16) -> FileSystem:
 class TestStrategies(unittest.TestCase):
     def test_example_1_2_indexed(self):
         """Exemplo 1.2 do enunciado: app.log de 10 KB em blocos de 4 KB."""
-        fs = FileSystem.format(4 * KB, 16, "indexed")
+        fs = make_fs(4 * KB, 16, "indexed")
         fs.mkdir("/sistema/logs", parents=True)
         f = fs.create("/sistema/logs/app.log", b"l" * 10 * KB)
         report = analyze(fs)
-        self.assertEqual(report.blocks[0].role, INDEX)  # i-node da raiz no bloco 0
+        self.assertEqual(report.blocks[0].role, META)  # superbloco
+        self.assertEqual(report.blocks[fs.layout.data_start].role, INDEX)  # i-node da raiz
         obj = next(o for o in report.objects if o.inode.id == f.id)
         self.assertEqual(len(obj.meta_blocks), 1)
         self.assertEqual(len(obj.data_blocks), 3)
@@ -203,9 +218,9 @@ class TestStrategies(unittest.TestCase):
     def test_contiguous_external_fragmentation_and_defrag(self):
         fs = holes_scenario("contiguous")
         report = analyze(fs)
-        self.assertEqual(report.free_blocks, 9)
+        self.assertEqual(report.free_blocks, 6)
         self.assertEqual(report.largest_free, 3)
-        self.assertEqual(report.external_frag_blocks, 6)
+        self.assertEqual(report.external_frag_blocks, 3)
         self.assertTrue(report.needs_compaction)
         with self.assertRaisesRegex(NoSpaceError, "fragmentação externa"):
             fs.create("/docs/grande.bin", b"g" * 20 * KB)
@@ -216,7 +231,7 @@ class TestStrategies(unittest.TestCase):
         self.assertEqual(analyze(fs).objects[-1].segments, 1)
 
     def test_contiguous_growth_relocates_when_blocked(self):
-        fs = FileSystem.format(1 * KB, 16, "contiguous")
+        fs = make_fs(1 * KB, 16, "contiguous")
         fs.create("/a", b"a" * KB)
         fs.create("/b", b"b" * KB)
         start = fs.resolve("/a").alloc["start"]
@@ -227,7 +242,7 @@ class TestStrategies(unittest.TestCase):
         self.assertEqual(fs.read("/a"), b"a" * KB + b"A" * KB)
 
     def test_fat_uses_scattered_blocks(self):
-        fs = holes_scenario("fat")
+        fs = holes_scenario("fat", blocks=17)  # a tabela FAT ocupa 1 bloco a mais
         self.assertEqual(analyze(fs).external_frag_bytes, 0)
         f = fs.create("/docs/grande.bin", b"g" * 20 * KB)
         chain = fs.allocator.data_blocks(f)
@@ -241,12 +256,12 @@ class TestStrategies(unittest.TestCase):
         f = fs.create("/docs/grande.bin", b"g" * 16 * KB)
         self.assertGreater(analyze(fs).objects[-1].segments, 1)
         index_block = f.alloc["index"]
-        raw = fs.disk.read_block(index_block)
+        raw = fs.dev.read_block(index_block)
         self.assertEqual(int.from_bytes(raw[:4], "little"), 4)  # 4 ponteiros gravados no bloco
         self.assertEqual(fs.read("/docs/grande.bin"), b"g" * 16 * KB)
 
     def test_indexed_max_file_size(self):
-        fs = FileSystem.format(128, 64, "indexed")  # bloco de 128 B -> 31 ponteiros
+        fs = make_fs(128, 64, "indexed")  # bloco de 128 B -> 31 ponteiros
         with self.assertRaisesRegex(NoSpaceError, "bloco de índice"):
             fs.create("/f", b"x" * 32 * 128)
         fs.create("/f", b"x" * 31 * 128)

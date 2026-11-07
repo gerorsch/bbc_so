@@ -1,0 +1,27 @@
+# Etapa 2 — Comparação dos níveis de RAID (0, 1 e 4)
+io_trace off
+
+# RAID 0 (striping): capacidade e desempenho somados, SEM redundância
+format --raid 0 --disks 2 --block-size 4KB --blocks 16 --alloc contiguous -y
+write_file /video.mp4 --size 16KB
+raid_map /video.mp4
+raid_test /video.mp4 --disk 2
+
+# RAID 1 (espelhamento): cada bloco gravado nos dois discos; capacidade de 1 disco
+format --raid 1 --disks 2 --block-size 4KB --blocks 16 --alloc contiguous -y
+write_file /contrato.pdf --size 8KB
+raid_map /contrato.pdf
+raid_test /contrato.pdf --disk 1
+raid_replace 1
+disk_status
+
+# RAID 4 (paridade dedicada): toda escrita atualiza o disco de paridade, que vira gargalo
+format --raid 4 --disks 3 --block-size 4KB --blocks 16 --alloc contiguous -y
+write_file /a.txt --size 8KB
+write_file /b.txt --size 8KB
+write_file /c.txt --size 8KB
+raid_map /b.txt
+disk_status
+raid_test /b.txt --disk 3
+raid_replace 3
+raid_check

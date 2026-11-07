@@ -8,8 +8,8 @@ from rich.console import Group
 from rich.table import Table
 from rich.text import Text
 
-from .allocation import FAT_EOF, ContiguousAllocator, FATAllocator, IndexedAllocator
-from .diagnostics import DIRDATA, FREE, INDEX, DiskReport
+from .allocation import FAT_EOF, FAT_FREE, FAT_RESERVED, ContiguousAllocator, FATAllocator, IndexedAllocator
+from .diagnostics import DIRDATA, FREE, INDEX, META, DiskReport
 from .filesystem import DIRENT, FileSystem
 from .inode import Inode
 from .units import compress_runs, fmt_size, plural
@@ -20,6 +20,7 @@ FILE_COLORS = [
     "#d19a66", "#f0a6ca", "#a9b665", "#89b4fa", "#ff9e64", "#7dcfff",
 ]
 DIR_COLORS = ["#5c6370", "#4f5b66", "#6e6a86"]
+META_STYLE = "bold #abb2bf on #2c313a"
 
 
 # ===================================================================== árvore
@@ -89,7 +90,7 @@ def _alloc_description(fs: FileSystem, inode: Inode) -> str:
 
 
 def render_stat(fs: FileSystem, inode: Inode) -> Table:
-    bs = fs.disk.block_size
+    bs = fs.block_size
     meta, data = fs.blocks_of(inode)
     allocated = len(data) * bs
     t = Table.grid(padding=(0, 1))
@@ -151,8 +152,10 @@ def render_header(report: DiskReport) -> Group:
     line1.append(report.strategy_label, style="bold cyan")
     used = report.used_blocks
     line2 = Text(
-        f"Ocupados: {used}/{n} blocos ({used / n:.1%}) | Livres: {report.free_blocks} "
-        f"({fmt_size(report.free_blocks * bs)})",
+        f"Dispositivo: {report.device} | Ocupados: {used}/{n} blocos ({used / n:.1%}) | "
+        f"Livres: {report.free_blocks} ({fmt_size(report.free_blocks * bs)}) | "
+        f"Metadados: {plural(report.count(META), 'bloco')} | "
+        f"I-nodes: {len(report.objects)}/{report.inode_count} em uso",
         style="dim",
     )
     return Group(line1, line2)
@@ -174,6 +177,9 @@ def render_grid(fs: FileSystem, report: DiskReport) -> Group:
             if info.role == FREE:
                 line.append(" · ", style="grey35")
                 continue
+            if info.role == META:
+                line.append(" ■ ", style=META_STYLE)
+                continue
             sym = pal.symbol[info.owner]
             if info.role == INDEX:
                 line.append(f"[{sym}]", style=pal.index_style(info.owner, inodes[info.owner].is_dir))
@@ -185,6 +191,8 @@ def render_grid(fs: FileSystem, report: DiskReport) -> Group:
 
     sample = "bold black on #98c379"
     legend = Text("  ")
+    legend.append(" ■ ", style=META_STYLE)
+    legend.append(" metadados   ", style="dim")
     legend.append(" · ", style="grey35")
     legend.append(" livre   ", style="dim")
     legend.append(" A ", style=sample)
@@ -252,6 +260,16 @@ def render_block_list(fs: FileSystem, report: DiskReport) -> Group:
             i = j + 1
             continue
 
+        if info.role == META:
+            j = i
+            while j + 1 < len(blocks) and blocks[j + 1].region == info.region:
+                j += 1
+            left = f"Bloco {i:0{w}d}" if i == j else f"Bloco {i:0{w}d}..{j:0{w}d}"
+            tag, desc = _meta_description(info.region, report)
+            lines.append(row(left, tag, "bold white", Text(desc, style="grey70")))
+            i = j + 1
+            continue
+
         owner = fs.inodes[info.owner]
         path = fs.path_of(owner)
         kind = "Diretório" if owner.is_dir else "Arquivo"
@@ -279,11 +297,22 @@ def render_block_list(fs: FileSystem, report: DiskReport) -> Group:
         lines.append(Text("[TABELA FAT] (área de metadados; bloco → próximo)", style="bold"))
         fat_line = Text()
         for b, nxt in enumerate(fs.allocator.fat):
-            if nxt == -2:
+            if nxt in (FAT_FREE, FAT_RESERVED):
                 continue
             fat_line.append(f"{b}→{'EOF' if nxt == FAT_EOF else nxt}  ")
         lines.append(fat_line if fat_line.plain else Text("(vazia)", style="dim"))
     return Group(*lines)
+
+
+def _meta_description(region: str, report: DiskReport) -> tuple[str, str]:
+    if region == "superbloco":
+        return "[SUPERBLOCO]", "geometria do volume, estratégia de alocação e posição de cada região"
+    if region == "bitmap":
+        return "[BITMAP]", "mapa de blocos livres (1 bit por bloco)"
+    if region == "fat":
+        return "[FAT]", "tabela de encadeamento: próximo bloco de cada bloco (4 bytes por entrada)"
+    return "[TAB_INODES]", (f"tabela de i-nodes: {len(report.objects)}/{report.inode_count} em uso "
+                            "(tipo, tamanho, datas e ponteiro de alocação)")
 
 
 def _verdict_text(report: DiskReport) -> Text:

@@ -1,5 +1,7 @@
 # Alocação ENCADEADA (FAT): mesmo cenário da contígua, sem fragmentação externa
-format --alloc fat --block-size 4KB --blocks 16 -y
+# (17 blocos: a própria tabela FAT ocupa 1 bloco da área de metadados)
+format --alloc fat --block-size 4KB --blocks 17 --raid none --disk-type hdd -y
+io_trace off
 mkdir /docs
 create /docs/a.txt --size 8KB
 create /docs/b.txt --size 12KB

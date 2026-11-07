@@ -1,0 +1,16 @@
+# Etapa 2 — RAID 5: striping com paridade distribuída e tolerância a falha de 1 disco
+# Exemplo 2.2 do enunciado: 3 discos físicos com blocos de 4 KB
+format --raid 5 --disks 3 --block-size 4KB --blocks 16 --alloc contiguous --disk-type hdd -y
+mkdir /dados
+write_file /dados/planilha.csv --size 8KB
+raid_map /dados/planilha.csv
+disk_status
+# Teste de falha (como no enunciado): derruba o Disco 2 e lê o arquivo por reconstrução (XOR)
+raid_test /dados/planilha.csv --disk 2
+# Com o arranjo degradado, as leituras continuam funcionando pela paridade
+read_file /dados/planilha.csv
+raid_map /dados/planilha.csv
+# Troca do disco falho por um novo e reconstrução completa
+raid_replace 2
+raid_check
+disk_status

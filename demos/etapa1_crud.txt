@@ -1,5 +1,6 @@
 # CRUD e navegação com caminhos absolutos e relativos (alocação indexada, blocos de 1 KB)
-format --alloc indexed --block-size 1KB --blocks 32 -y
+format --alloc indexed --block-size 1KB --blocks 32 --raid none --disk-type hdd -y
+io_trace off
 mkdir -p /home/user/projetos
 cd /home/user
 pwd

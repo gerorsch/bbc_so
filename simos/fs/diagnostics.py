@@ -10,7 +10,7 @@ from .filesystem import FileSystem
 from .inode import Inode
 from .units import count_segments, fmt_size, plural
 
-FREE, DATA, DIRDATA, INDEX = "free", "data", "dir", "index"
+FREE, DATA, DIRDATA, INDEX, META = "free", "data", "dir", "index", "meta"
 
 
 @dataclass
@@ -21,6 +21,7 @@ class BlockInfo:
     seq: int = 0  # posição do bloco dentro do arquivo (1, 2, 3...)
     used: int = 0  # bytes de conteúdo efetivamente usados no bloco
     next: int | None = None  # próximo bloco na cadeia FAT (-1 = EOF)
+    region: str = ""  # região de metadados (superbloco, bitmap, fat, inodes)
 
 
 @dataclass
@@ -50,6 +51,8 @@ class DiskReport:
     max_file_now: int
     max_file_after: int
     scattered: list[ObjectStats] = field(default_factory=list)
+    inode_count: int = 0
+    device: str = ""
 
     # ---- contagens ----
     def count(self, role: str) -> int:
@@ -134,8 +137,10 @@ class DiskReport:
 
 
 def analyze(fs: FileSystem) -> DiskReport:
-    bs = fs.disk.block_size
-    blocks = [BlockInfo(i) for i in range(fs.disk.num_blocks)]
+    bs = fs.block_size
+    blocks = [BlockInfo(i) for i in range(fs.num_blocks)]
+    for b in range(fs.layout.data_start):
+        blocks[b] = BlockInfo(b, META, region=fs.layout.region_of(b))
     objects: list[ObjectStats] = []
     fat = fs.allocator.fat if isinstance(fs.allocator, FATAllocator) else None
 
@@ -174,7 +179,7 @@ def analyze(fs: FileSystem) -> DiskReport:
 
     return DiskReport(
         block_size=bs,
-        num_blocks=fs.disk.num_blocks,
+        num_blocks=fs.num_blocks,
         strategy=fs.allocator.key,
         strategy_label=fs.allocator.label,
         blocks=blocks,
@@ -183,4 +188,6 @@ def analyze(fs: FileSystem) -> DiskReport:
         max_file_now=max_now,
         max_file_after=max_after,
         scattered=[o for o in objects if o.segments > 1],
+        inode_count=fs.layout.inode_count,
+        device=fs.dev.describe(),
     )

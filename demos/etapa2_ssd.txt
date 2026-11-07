@@ -1,0 +1,20 @@
+# Etapa 2 — SSD: acesso por páginas/blocos, coleta de lixo e desgaste (wear leveling)
+# 1) SEM wear leveling: um arquivo "frio" (nunca muda) e um "quente" (regravado sem parar)
+format --disk-type ssd --raid none --block-size 4KB --blocks 16 --alloc indexed --wl off -y
+io_trace off
+create /frio.dat --size 20KB
+create /quente.log --size 4KB
+repeat 80 write /quente.log --size 4KB
+ssd_status
+
+# 2) COM wear leveling (dinâmico + estático): mesmo padrão de escritas
+format --disk-type ssd --raid none --block-size 4KB --blocks 16 --alloc indexed --wl on -y
+create /frio.dat --size 20KB
+create /quente.log --size 4KB
+repeat 80 write /quente.log --size 4KB
+ssd_status
+
+# Uma escrita com o rastro de E/S ligado: no SSD não há braço; o FTL remapeia a página lógica
+io_trace detalhado
+write /quente.log "nova versão do log"
+disk_status

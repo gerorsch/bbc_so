@@ -19,10 +19,19 @@ class Inode:
     alloc: dict = field(default_factory=dict)
     created: float = field(default_factory=time.time)
     modified: float = field(default_factory=time.time)
-    # Campos reconstruídos a partir dos blocos de diretório (não persistidos no i-node):
+    # Campos reservados para a Etapa 3 (segurança): flags, permissões e dono.
+    flags: int = 0
+    mode: int = 0
+    uid: int = 0
+    gid: int = 0
+    # Campos reconstruídos a partir dos blocos de diretório (não ficam no i-node em disco):
     name: str = ""
     parent: int | None = None
     children: dict[str, int] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not self.mode:
+            self.mode = 0o755 if self.type == DIR else 0o644
 
     @property
     def is_dir(self) -> bool:
@@ -30,24 +39,3 @@ class Inode:
 
     def touch(self) -> None:
         self.modified = time.time()
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "type": self.type,
-            "size": self.size,
-            "alloc": self.alloc,
-            "created": self.created,
-            "modified": self.modified,
-        }
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "Inode":
-        return cls(
-            id=d["id"],
-            type=d["type"],
-            size=d["size"],
-            alloc=dict(d["alloc"]),
-            created=d["created"],
-            modified=d["modified"],
-        )
